@@ -1,13 +1,46 @@
 <?php
-session_start();
 require __DIR__ . '/config.php';
 require_once __DIR__ . '/github-data.php';
 
 function h($value) { return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8'); }
 function redir() { header('Location: index.php'); exit; }
+function auth_secret() {
+    $key = GITHUB_TOKEN !== '' ? GITHUB_TOKEN : ADMIN_PASSWORD;
+    return hash_hmac('sha256', 'configbox-admin-cookie|' . ADMIN_PASSWORD, $key);
+}
+function cookie_is_secure() {
+    return (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off')
+        || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
+}
+function admin_auth_expiry() {
+    $cookie = (string) ($_COOKIE['configbox_admin_auth'] ?? '');
+    $parts = explode('.', $cookie, 2);
+    if (count($parts) !== 2 || !ctype_digit($parts[0])) return 0;
+    $expires = (int) $parts[0];
+    if ($expires <= time() || $expires > time() + 30 * 24 * 60 * 60 + 120) return 0;
+    $expected = hash_hmac('sha256', 'admin|' . $expires, auth_secret());
+    return hash_equals($expected, $parts[1]) ? $expires : 0;
+}
+function is_admin_authenticated() { return admin_auth_expiry() > 0; }
+function set_admin_auth_cookie() {
+    $expires = time() + 30 * 24 * 60 * 60;
+    $value = $expires . '.' . hash_hmac('sha256', 'admin|' . $expires, auth_secret());
+    setcookie('configbox_admin_auth', $value, [
+        'expires' => $expires, 'path' => '/', 'secure' => cookie_is_secure(),
+        'httponly' => true, 'samesite' => 'Lax'
+    ]);
+    $_COOKIE['configbox_admin_auth'] = $value;
+}
+function clear_admin_auth_cookie() {
+    setcookie('configbox_admin_auth', '', [
+        'expires' => time() - 3600, 'path' => '/', 'secure' => cookie_is_secure(),
+        'httponly' => true, 'samesite' => 'Lax'
+    ]);
+    unset($_COOKIE['configbox_admin_auth']);
+}
 function token() {
-    if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(24));
-    return $_SESSION['csrf'];
+    $expires = admin_auth_expiry();
+    return $expires > 0 ? hash_hmac('sha256', 'csrf|' . $expires, auth_secret()) : '';
 }
 function encpath($path) { return implode('/', array_map('rawurlencode', explode('/', trim($path, '/')))); }
 function github($method, $path, $body = null) {
@@ -50,18 +83,21 @@ function safename($name) {
 }
 function sizefmt($size) { return $size < 1024 ? $size . ' B' : ($size < 1048576 ? round($size / 1024, 1) . ' KB' : round($size / 1048576, 1) . ' MB'); }
 function authpost() {
-    if (empty($_SESSION['admin'])) redir();
-    if (!isset($_POST['csrf']) || !hash_equals($_SESSION['csrf'] ?? '', (string) $_POST['csrf'])) throw new RuntimeException('Sessão expirada. Atualize a página.');
+    if (!is_admin_authenticated()) redir();
+    $expected = token();
+    if ($expected === '' || !isset($_POST['csrf']) || !hash_equals($expected, (string) $_POST['csrf'])) {
+        throw new RuntimeException('Autenticação expirada. Entre novamente no painel.');
+    }
 }
 
 $settings = ['plan_active' => true, 'lock_message' => '', 'dialog_message' => ''];
 $devices = []; $configs = []; $unitvLink = ['url' => '']; $msg = null; $error = false;
 try {
-    if (isset($_GET['logout'])) { session_destroy(); redir(); }
+    if (isset($_GET['logout'])) { clear_admin_auth_cookie(); redir(); }
     if (isset($_POST['login'])) {
         if (ADMIN_PASSWORD === '') throw new RuntimeException('Senha administrativa não configurada no ambiente do servidor.');
         if (!hash_equals(ADMIN_PASSWORD, (string) ($_POST['password'] ?? ''))) throw new RuntimeException('Senha inválida.');
-        session_regenerate_id(true); $_SESSION['admin'] = true; token(); redir();
+        set_admin_auth_cookie(); redir();
     }
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         authpost();
@@ -129,7 +165,7 @@ try {
         }
     }
 
-    $logged = !empty($_SESSION['admin']);
+    $logged = is_admin_authenticated();
     if ($logged) {
         $settings = github_settings_read()['settings'];
         $devices = github_devices_read()['items'];
@@ -138,7 +174,7 @@ try {
     }
 } catch (Throwable $exception) {
     $msg = $exception->getMessage(); $error = true;
-    $logged = !empty($_SESSION['admin']);
+    $logged = is_admin_authenticated();
 }
 ?><!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ConfigBox Admin</title><style>
 :root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#17243b;background:#f5f7fb}*{box-sizing:border-box}body{margin:0}.shell{max-width:1060px;margin:auto;padding:24px 16px 55px}.card{background:#fff;border:1px solid #e3e9f2;border-radius:18px;padding:20px;margin:16px 0;box-shadow:0 7px 25px #1e3a5f0b}.login{max-width:420px;margin:12vh auto}.head{display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{display:flex;gap:12px;align-items:center}.logo{width:43px;height:43px;border-radius:13px;background:#2563eb;color:#fff;display:grid;place-items:center;font-weight:900;font-size:20px}.eyebrow{color:#2563eb;font-size:11px;font-weight:900;letter-spacing:1.2px;margin:0 0 4px}.title{font-size:26px;margin:0;letter-spacing:-.5px}.sub,.muted{color:#6d7b91;font-size:13px}.repo{margin-top:18px;padding:13px;border-radius:12px;background:#eaf2ff;color:#2458a8;font:13px monospace;overflow:auto}.notice{padding:12px 14px;border-radius:11px;margin:16px 0;font-size:14px}.success{background:#e8f8ee;color:#176b3c}.error{background:#fff0f0;color:#a51d1d}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:14px}.section-head h2{font-size:19px;margin:0}.count{background:#e8eefb;color:#31599d;border-radius:99px;padding:5px 10px;font-size:12px;font-weight:800}.input,.textarea{width:100%;border:1px solid #d3ddea;border-radius:10px;padding:11px;font:inherit;margin:5px 0 12px;background:#fcfdff}.textarea{min-height:80px;resize:vertical}.button{display:inline-flex;border:0;border-radius:10px;padding:11px 14px;font:inherit;font-weight:800;cursor:pointer;text-decoration:none;justify-content:center}.primary{background:#2563eb;color:white}.secondary{background:#edf2f8;color:#29415f}.danger{background:#fff0f0;color:#aa211b}.file-list{display:flex;flex-direction:column;gap:9px;margin-top:14px}.file-row{display:flex;align-items:center;gap:10px;border:1px solid #e3eaf3;border-radius:12px;padding:11px}.icon{width:37px;height:37px;border-radius:10px;background:#eff6ff;color:#2563eb;display:grid;place-items:center;font-size:11px;font-weight:900;flex:none}.file-info{min-width:0;flex:1}.file-name{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.file-meta{font-size:12px;color:#7a8799;margin-top:3px}.file-actions{display:flex;gap:6px;flex:none}.empty{border:1px dashed #cbd6e5;border-radius:12px;padding:20px;text-align:center;color:#7b889a;font-size:13px}.device{border:1px solid #e3eaf3;border-radius:12px;padding:14px;margin-top:9px}.device-top{display:flex;justify-content:space-between;gap:10px}.device-info{min-width:0}.device-info strong{display:block}.device-info small{display:block;color:#718096;margin-top:4px;word-break:break-word}.badge{font-size:11px;border-radius:99px;padding:5px 9px;background:#e8f8ee;color:#176b3c;height:max-content;white-space:nowrap}.badge.blocked{background:#fff0f0;color:#a51d1d}.device form{margin-top:10px}.footer{text-align:center;color:#8794a7;font-size:12px}@media(max-width:720px){.grid{grid-template-columns:1fr}.title{font-size:23px}.file-row{align-items:flex-start;flex-wrap:wrap}.file-info{min-width:calc(100% - 50px)}.file-actions{width:100%;padding-left:47px}.file-actions .button{flex:1}.head{align-items:flex-start}}
